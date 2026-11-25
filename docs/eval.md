@@ -1,68 +1,64 @@
 # Eval
 
-This page covers `uv run eval` — evaluating a model in one or more environments. For the online evals of a training run, see [Training](training.md#online-evals).
+`uv run eval` runs one complete evaluation pass over one or more `verifiers` environments and exits. It uses the same worker-pool and concurrency engine as RL training, streams live traces to the local dashboard, and supports resuming interrupted runs.
 
-> **AI agents working in this repo:** the equivalent runbook is at [`skills/eval/SKILL.md`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/skills/eval/SKILL.md).
+For periodic evals *during* training, see [Training § Online Evals](training.md#online-evals).
 
-## Table of Contents
+> **For AI coding agents:** see [`skills/eval/SKILL.md`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/skills/eval/SKILL.md).
 
-- [Launch](#launch)
-- [Configuration](#configuration)
-- [Live Concurrency](#live-concurrency)
-- [Resume](#resume)
-- [Monitors](#monitors)
-  - [File](#file)
-  - [Prime](#prime)
-- [Metrics](#metrics)
+## Quick Start
 
-`uv run eval` runs one epoch of every configured source and exits. It reuses the orchestrator's eval pipeline: env worker pools are spawned per source, episodes are admitted under the concurrency controller, and every episode streams into the run's trace stream and metrics.
+### Against Prime Inference (Default)
 
-## Launch
-
-By default the model is served by Prime Inference; authenticate with `PRIME_API_KEY` or `prime login`:
+Authenticate with `prime login` (or `PRIME_API_KEY`) and pass a taskset ID directly:
 
 ```bash
-uv run eval gsm8k -n 32 -r 4 -c 8                                   # Prime Inference
-uv run eval @ configs/debug/eval/single-turn.toml                   # the same shape as a TOML
+uv run eval gsm8k -n 32 -r 4 -c 8
 ```
 
-The default endpoint comes from `PRIME_INFERENCE_URL`, then the Prime CLI's `inference_url`, then the standard Prime Inference URL. An explicit `client.base_url` wins. API keys and environment-backed headers are resolved when clients are built; Prime CLI credential and team fallbacks apply only to Prime Inference hosts, including for a separate admin URL.
+This evaluates 32 tasks (`-n`), 4 rollouts per task (`-r`), at fixed concurrency 8 (`-c`). The endpoint resolves from `client.base_url` → `PRIME_INFERENCE_URL` → Prime CLI `inference_url` → default Prime Inference URL.
 
-To evaluate a model you serve yourself, start a `uv run inference` vLLM server (or any OpenAI-compatible API) and point the client at it:
+### Against Your Own vLLM Server (or Any OpenAI API)
 
 ```bash
 uv run inference --vllm.model Qwen/Qwen3-4B
 uv run eval gsm8k -n 32 -r 4 -m Qwen/Qwen3-4B --client.base_url http://localhost:8000/v1
 ```
 
-Single-source shorthands: `<taskset-id>` names the run's only source, `--env.<field> <value>` sets a field of that source's env block (`--env.agent.harness.id bash`, `--env.taskset.tasks '["fix-git"]'`), `-n`/`-s`/`-r` set `select.limit`/`select.shuffle`/`group_size`, `-m` the model, and `-c N` pins the concurrency band (`concurrency.min_inflight = max_inflight = N`). `<taskset-id>` cannot be combined with a TOML that defines `[[source]]` blocks; next to one, `--env.<field>` sets the shared [env block](#configuration) instead. `uv run eval -h` lists them.
+### Handy Single-Source CLI Shorthands
 
-Against a local vLLM deployment, set `min_inflight < max_inflight` in `[concurrency]` to dynamically adjust the number of concurrent episodes for maximum throughput. An external API exposes no vLLM `/metrics` to adapt to, so pin the concurrency there (`-c N`, i.e. `min_inflight = max_inflight`).
+When you pass `<taskset-id>` on the command line (without a multi-source TOML):
+- `-m <model>` — model name
+- `-n N` — `select.limit` (number of tasks)
+- `-s` — `select.shuffle`
+- `-r K` — `group_size` (rollouts per task)
+- `-c N` — pin concurrency (`min_inflight = max_inflight = N`)
+- `--env.<field> <value>` — override env settings (e.g., `--env.agent.harness.id bash`, `--env.taskset.tasks '["fix-git"]'`)
 
-Against a disaggregated prefill/decode deployment, list the engines in `client.admin_base_url` and give each one's role in `inference_metrics_roles` (same order, `"prefill"` or `"decode"`), so the controller reads prefill and decode engines apart.
+Run `uv run eval -h` to see all shorthands.
 
-## Configuration
+## Multi-Source TOML Config
 
-Multi-source runs use a TOML (`EvalConfig` in `packages/prime-rl-configs/src/prime_rl/configs/eval.py`). The eval block is flattened to the top level — `[[source]]`, `[client]`, `[concurrency]`, `[sampling]`, `[select]`, `group_size` — and each source takes the same `env` block as `[[orchestrator.eval.source]]`:
+For repeatable or multi-environment evals, put everything in a TOML file (`uv run eval @ eval.toml`). Top-level `[select]`, `[sampling]`, `[env]`, and `group_size` act as defaults that each `[[source]]` inherits and can override:
 
 ```toml
 model = "Qwen/Qwen3-4B"
 group_size = 4
 
-[select]             # every source inherits these
-limit = 32
-
 [client]
 base_url = "http://localhost:8000/v1"
 
-[concurrency]        # adaptive against a local vLLM deployment
+[concurrency]            # adaptive against local vLLM; pin min == max for external APIs
 min_inflight = 8
 max_inflight = 256
 
 [sampling]
 max_completion_tokens = 2048
 
-[env]                # every source inherits these
+[select]                 # shared task selection defaults
+limit = 32
+
+[env]                    # shared env defaults
 timeout.episode = 7200
 retries.max_retries = 3
 
@@ -77,73 +73,63 @@ env.agent.runtime.type = "subprocess"
 select.include.idx = ["0:30"]
 ```
 
-Per-source `group_size` and `sampling` override the top-level defaults. The top-level `[env]` block holds the env knobs that every source inherits (see [Environments](configuration.md#environments)); a source's own `env` values win.
+**Good to know:**
+- **Concurrency:** Set `min_inflight < max_inflight` against a local vLLM server so the [adaptive controller](inference.md#adaptive-concurrency) finds peak throughput automatically. External APIs don't expose vLLM `/metrics`, so pin concurrency with `-c N`. Against a disaggregated P/D deployment, list engine admin URLs in `client.admin_base_url` with matching `"prefill"` / `"decode"` labels in `inference_metrics_roles`.
+- **Task selection (`select`):** Applies `include`/`exclude` (by `idx`, `ids`, `keys`, `names`, or newline-delimited files via `include.files.*` / `exclude.files.*`) → `shuffle` → `skip` → `limit`. See `verifiers`' [task selection docs](../deps/verifiers/docs/v1/tasksets.md#selecting-tasks).
+- **Worker pools:** Each source spawns its own broker + worker pool on an OS-assigned loopback port (saved to `configs/attempt_N/resolved/envs/eval/<name>.address`), so parallel eval runs on the same machine never collide. Set `serve.address` to connect to an externally managed pool instead.
 
-Each field a source sets in its `select` overrides the same field of the top-level `[select]`. `select` picks which tasks of the taskset run: `include`/`exclude` by task `idx`/`ids`/`keys`/`names`, then `shuffle`, `skip` and `limit`. For long lists, `include.files` and `exclude.files` read the entries from newline-delimited text files (`select.exclude.files.keys = "broken_keys.txt"`) (see verifiers' [Selecting tasks](../deps/verifiers/docs/v1/tasksets.md#selecting-tasks)). Train sources take the same `select`.
+## Adjusting Concurrency Live
 
-Every source's env worker pool is spawned by the eval process unless the source sets `serve.address`, in which case the pool is externally managed. A pool's broker binds an OS-assigned loopback port and publishes it to `configs/attempt_N/resolved/envs/eval/<name>.address`, which the eval process reads, so concurrent runs on one host never collide on a port.
-
-## Live Concurrency
-
-With `--control`, a running eval serves a small API on port 8040 to read and change its episode concurrency, so a shared endpoint's capacity can move between evals without restarting them. `PUT` pins the cap at `target`, outside the configured band too, and `null` hands it back to the adaptive controller. Lowering it cancels nothing: new episodes wait until enough running ones finish. When `PRIME_RL_ADMIN_TOKEN` is set, every request must carry it in the `X-Prime-Admin-Token` header ([Admin Routes](inference.md#admin-routes)).
+Pass `--control` to expose an HTTP endpoint on port `8040` for shifting concurrency between runs sharing an inference server (if `PRIME_RL_ADMIN_TOKEN` is set, include `X-Prime-Admin-Token`):
 
 ```bash
 uv run eval @ eval.toml -c 2000 --control
 
+# Check current state
 curl localhost:8040/v1/concurrency
 # {"target": null, "cap": 2000, "inflight": 2000}
+
+# Lower the cap (in-flight episodes finish normally; new ones wait)
 curl -X PUT localhost:8040/v1/concurrency -H 'content-type: application/json' -d '{"target": 1500}'
-# {"target": 1500, "cap": 1500, "inflight": 2000}
+
+# Hand control back to the adaptive controller
+curl -X PUT localhost:8040/v1/concurrency -H 'content-type: application/json' -d '{"target": null}'
 ```
 
-## Resume
+## Resuming Interrupted Evals
 
-An interrupted run resumes from its trace stream. Relaunch with the same `--run.name` and `--resume`: saved episodes with `episode.ok` rejoin the epoch as if they had just arrived (stream, metrics and platform upload cover the whole epoch), and only the rollouts still owed run. Failed episodes and the ones the interruption cut off run again. Saved records that fail schema validation stop the resume before the current stream is archived.
+Give your eval a `--run.name`. If it crashes or gets killed, re-run with `--resume`—every completed `episode.ok` rollout is reused and only failed or missing rollouts re-run:
 
 ```bash
 uv run eval @ eval.toml --run.name my-eval
-# <interrupted>
+# ...interrupted...
 uv run eval @ eval.toml --run.name my-eval --resume
 ```
 
-The previous attempt's `monitors/file` is kept as `monitors/file.attempt_N`; the resumed attempt writes a fresh one. Nothing is deleted, and a resume reads every attempt's stream.
+How resume safety works:
+- Previous monitor output is preserved at `monitors/file.attempt_N`; nothing is deleted.
+- Tasks match by content hash (`task.hash`), so edited tasks automatically re-run even if their `task.key` didn't change. Duplicate task selections keep separate groups so `pass@k` stays accurate.
+- By default, `--resume` checks that the resolved config matches previous attempts exactly (ignoring `resume`) and refuses to mix mismatched runs. Pass `--resume.skip-checks` if you intentionally want to reuse old episodes after changing settings, or use `--clean` without `--resume` to start fresh.
 
-A landed episode counts toward a selected task in the same source when their content hashes (`task.hash`) match. A task whose content changes runs again even if its public `task.key` stays the same. Each selected occurrence keeps up to `group_size` matching episodes, and only its missing rollouts run. Each selected occurrence owns a separate group containing its restored and new rollouts, even when the same task is selected more than once, so pass@k and the dashboard see one group per selected occurrence.
+## Dashboard & Monitors
 
-Every attempt's saved resolved config must match the current config exactly, except for `resume`, before its episodes are reused. This includes operational settings such as logging and concurrency, source order, and shared defaults. Missing snapshots or config differences stop the resume before the trace stream is rotated; mismatches list the differing top-level fields. Use a fresh run name or `--clean` without `--resume` to start over.
+- **File monitor (on by default):** Streams metrics, `plan.json`, finished episodes, and turn-by-turn live traces (`monitors/file/traces/live/<trace_id>.jsonl`) to disk.
+- **Local dashboard (`uv run dashboard outputs/`):**
+  - **Overview tab:** Shows a live progress grid (landed, errored, and in-flight episodes—click any cell to inspect), headline stats (`avg@k`, `pass@k`, error/truncation rates, turns, latency, cost), per-metric beeswarm/dot plots, and token/phase timing breakdowns (boot, setup, model, harness, finalize, scoring).
+  - **Traces tab:** Follows live rollouts turn by turn (with phase badges and pending model calls dimmed) alongside finished episodes. You can also inspect a live trace from the terminal with `uv run python -m prime_rl.monitors.file.traces <run_dir> [<trace_id>]`.
+  - **Metrics tab:** Charts `eval/<env>/*` summaries plus live `inference/` and `concurrency/` telemetry.
+- **W&B (`--monitors.wandb`)** and **Prime Lab (`--monitors.prime`)**: Stream each env's evaluation live. `--monitors.prime` requires `PRIME_API_KEY` (`prime login`), writes its IDs to `monitors/prime/run.json`, and adds a **View on Prime** link to the local dashboard.
 
-To intentionally reuse episodes despite changed settings or missing snapshots, pass `--resume.skip-checks` (or set `skip_checks = true` in a `[resume]` TOML section). This enables resume and bypasses compatibility checks for every attempt; restored and new episodes may therefore come from different experiment settings. A bare `--resume` or empty `[resume]` section keeps the checks enabled.
+## Logged Metrics
 
-## Monitors
+Eval metrics live under `eval/<env>/`:
 
-Monitors receive the run's metrics and episodes through one abstraction. The file monitor is on by default; `--monitors.wandb` logs the run to Weights & Biases, and `--monitors.prime` streams it to the Prime platform.
-
-### File
-
-The file monitor writes the run's metrics and trace stream under `output_dir / run.name / monitors/file/` and feeds the local [dashboard](training.md#dashboard). Env worker pools stream every rollout to the eval process as it happens: the trace's header when it is minted, then one delta per committed turn (the new messages and the model call behind them), per phase change (boot, setup, agent, finalize, scoring), and a preview of each model request's uncommitted messages, so a tool result shows the moment the model is asked about it rather than with the reply. The file monitor appends those deltas to `monitors/file/traces/live/<trace_id>.jsonl` and deletes the file when the episode lands in the finished trace stream, so that directory is exactly the live set and finished traces stay where they always were. The dashboard's traces tab shows live rollouts in the episode table itself: a pulsing dot in the `#` cell marks the row, a phase badge says where the rollout is (boot, setup, running, finalize, scoring), the `dispatched → arrived` column shows the dispatch time with the elapsed time in brackets, and the turn, token and branch counts grow as deltas land. The status filter toggles live and completed rows, and a live row opens in the trace viewer, which follows the rollout turn by turn (the transcript stays pinned to the newest turn until you scroll up; folded entries stay folded; the pending messages of the request in flight render dimmed with an `awaiting model` chip). The table and an open live trace poll once a second and transfer nothing while the rollout is unchanged. The progress line in `eval.log` counts the live rollouts by phase (`2 inflight episodes ... - boot 1 · running 1`). Read a live trace from a shell with `uv run python -m prime_rl.monitors.file.traces <run_dir> [<trace_id>]`. The same stream exists for RL runs, covering train and online-eval rollouts alike.
-
-The dashboard's overview tab reads the trace stream directly. It shows one env at a time; the filter menu picks the env and whether errored episodes join the distributions. A block bar has one cell per expected episode: landed episodes (errored ones in red; click one to open it), live rollouts as pulsing outlines (click one to follow it), and the rest empty, with the percentage beside it. The expected count is what the eval runner wrote to `monitors/file/plan.json` when it counted the epoch's tasks. Below the bar, a summary row gives the headline numbers: avg@k and pass@k, the error and truncation rates (yellow past 10%, red past 50%), mean turns and branches in one tile, mean episode time and tokens, and the total cost when the run has costs; hover a tile for its distribution. The env's own rewards and metrics follow, a beeswarm pane each, resizable like the training charts. The usage section is one pane splitting each episode's tokens into input and output, and the timing section is the same pane over the phases of a rollout (boot, setup, model, harness, finalize, scoring, and `other` for wall time no phase accounts for): an icicle bar shows the mean split, one strip per episode below shows the split per rollout, and a legend sits above. Hovering a phase highlights it across the pane; the strips show 40 episodes by default and all of them on `show all`. A metric every episode shares appears as a chip instead of a pane, and a metric with only a few distinct values, such as a binary reward, as a counted dot plot with the count and share of each value. Every dot is an episode (or a task): hover it for its value and click it to open the trace; hover the pane's background for the summary (min, p10, median, p90, max), with a faint boxplot behind the dots. Errored episodes stay out of the distributions until the filter includes them, where they read red. The metrics tab charts every key of the run's `metrics.jsonl`: the epoch's `eval/<env>/…` summaries and the time-keyed `inference/` and `concurrency/` rows the runner samples while the epoch is in flight.
-
-### Prime
-
-With `--monitors.prime`, each source's epoch streams as an evaluation on the Prime platform. The launcher prints each evaluation's link next to the local dashboard link (and the W&B run's, with `--monitors.wandb`) once the evaluation opens. The monitor needs `PRIME_API_KEY` (`prime login` or the env var); without one, the eval fails at launch and says so:
-
-```bash
-uv run eval gsm8k -n 32 -r 4 -c 8 --monitors.prime
-```
-
-The monitor opens one Prime evaluation per env when its epoch starts, streams every episode to it as it lands, and closes it with the epoch's aggregates. The run leaves its Prime identity in `monitors/prime/run.json` (one entry per evaluation), and the dashboard's top bar shows a `View on Prime` link from the moment the evaluation opens: a direct link for a training run or a single evaluation, a menu when a run has several.
-
-## Metrics
-
-Eval metrics mirror the training rollout hierarchy under the `eval/<env>` scope:
-
-| Metric | Reading |
+| Metric | Meaning |
 |---|---|
-| `eval/<env>/all/<agent>/reward/mean` | mean reward over the epoch |
-| `eval/<env>/all/<agent>/is_truncated/mean` | share of rollouts cut by the length limit |
-| `eval/<env>/all/<agent>/is_timeout/mean` | share of rollouts stopped by a stage deadline (`<stage>_timeout`) |
-| `eval/<env>/all/<agent>/has_error/mean` | share of rollouts that raised |
-| `eval/<env>/all/seq_len/mean` | mean episode length in tokens |
+| `eval/<env>/all/<agent>/reward/mean` | Mean reward across the epoch |
+| `eval/<env>/all/<agent>/is_truncated/mean` | Fraction of rollouts that hit the length limit |
+| `eval/<env>/all/<agent>/is_timeout/mean` | Fraction of rollouts stopped by a stage timeout |
+| `eval/<env>/all/<agent>/has_error/mean` | Fraction of rollouts that raised an exception |
+| `eval/<env>/all/seq_len/mean` | Mean episode length in tokens |
 
-Task-specific env metrics (e.g. `correct_answer`, `format`) appear under the same prefix. The console summary line per source (`Evaluated <env> ... Reward 0.8125`) reports the epoch mean.
+Any custom metrics returned by your environment (e.g., `correct_answer`, `format`) appear under the same prefix.

@@ -1,45 +1,55 @@
 # Overview
 
-`prime-rl` is a framework for large-scale, asynchronous reinforcement learning of large language models. It is designed to be easy to use and hackable, yet capable of training 1T+-parameter MoE models on 1000+ GPU clusters.
+`prime-rl` is a post-training framework for large language models—built primarily for asynchronous reinforcement learning (RL), with SFT, pretraining, and evals on the same stack. It runs on a single GPU for quick debugging and scales up to 1,000+ GPUs for trillion-parameter MoE models.
 
-## Architecture
+## How It Works
 
-A `prime-rl` RL run is three cooperating processes:
+An RL run splits the job into three cooperating processes so generating rollouts never blocks training (and vice versa):
 
 ![Architecture](assets/architecture.png)
 
-- **Inference** — vLLM-backed server (or fleet) holding the current policy. The orchestrator drives rollouts through the token-in `/inference/v1/generate` route via the [`renderers`](https://github.com/PrimeIntellect-ai/renderers) package (OpenAI-compatible chat/completions routes are also exposed for external clients). We are trying to stay up-to-date with the latest vLLM features, you can read more about the supported features and deployment options in the dedicated [inference documentation](inference.md).
-- **Orchestrator** — Lightweight CPU process that owns the data plane across many [`verifiers`](https://github.com/PrimeIntellect-ai/verifiers) training and eval environments. Each env runs in an isolated subprocess with a variable-size pool of env workers for scalability. The orchestrator drives multi-turn rollouts against the inference fleet (tool use, browsers, sandboxes, long horizons) without re-tokenizing across turns, computes advantages, packs the rollouts into training batches, and relays new weights from trainer to inference.
-- **Trainer** — FSDP2 process group that consumes packed rollouts and steps the optimizer. We ship optimized custom modeling code for many MoE / dense / VLM families that unlocks advanced trainer parallelism — expert parallelism (EP, with DeepEP kernels) and context parallelism (CP) for long-sequence training — plus selective activation checkpointing, FP8 training on Hopper+, and LoRA. You can read more in the dedicated [training documentation](training.md).
+1. **Inference** — One or more [vLLM](https://github.com/vllm-project/vllm) servers running the current policy. The orchestrator talks to them at the token level (`/inference/v1/generate`) using [`renderers`](https://github.com/PrimeIntellect-ai/renderers), so multi-turn conversations never lose tokens to chat-template re-tokenization. Standard OpenAI-compatible chat/completions routes are also exposed. See [Inference](inference.md).
+2. **Orchestrator** — A lightweight CPU coordinator that runs your [`verifiers`](https://github.com/PrimeIntellect-ai/verifiers) training and eval environments (each isolated in its own worker pool). It sends prompts to inference, runs tool calls/sandboxes, computes advantages, packs completed rollouts into training batches, and triggers weight syncs back to inference.
+3. **Trainer** — An FSDP2 training loop that pulls packed batches from the orchestrator and updates the weights. `prime-rl` uses its own custom model implementations under `src/prime_rl/trainer/models/` so it can support Expert Parallelism (EP), Context Parallelism (CP), FP8/MXFP8 training, activation offloading, and LoRA across dense, MoE, and VLM architectures. See [Training](training.md) and [Scaling](scaling.md).
 
-The three processes communicate through configurable transports — by default the trainer↔orchestrator rollout link uses ZMQ (each trainer rank requests a step before the orchestrator sends it, so the trainer only ever holds the batch it is training on), and weight broadcast uses NCCL for synchronous in-memory transfer (falling back to filesystem when LoRA is enabled or no inference server is configured). Swap the rollout link to the local filesystem (`rollout_transport.type = "filesystem"`) if you want rollouts persisted to disk. See [Scaling](scaling.md) for the deployment options.
+### How the Three Processes Talk
+
+- **Rollouts (Orchestrator → Trainer):** Sent over **ZMQ** by default. Each trainer rank pulls its next step on demand, so memory stays bounded. Switch to disk (`rollout_transport.type = "filesystem"`) if you want batches persisted to files.
+- **Weights (Trainer → Inference):** Broadcast in memory over **NCCL** by default. Automatically falls back to the **filesystem** when LoRA is enabled or no inference server is managed by the launcher. At large scale, you can also use [ModelExpress](model-express.md) or [NIXL](scaling.md#weight-broadcast-transports).
 
 ## Installation
+
+You need at least one NVIDIA GPU (tested on RTX 3090/4090/5090, A100, H100, H200, and B200). One GPU is enough for debugging; a typical RL run uses separate GPUs or nodes for inference and training.
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/PrimeIntellect-ai/prime-rl/main/scripts/install.sh | bash
 ```
 
-The script clones the repo, initializes the [`verifiers`](https://github.com/PrimeIntellect-ai/verifiers) / [`renderers`](https://github.com/PrimeIntellect-ai/renderers) / [`prime-envs`](https://github.com/PrimeIntellect-ai/prime-envs) submodules, installs `uv`, and runs `uv sync --all-extras`. For manual setup, or troubleshooting, see the [README](https://github.com/PrimeIntellect-ai/prime-rl#setup).
+This clones the repo, initializes the [`verifiers`](https://github.com/PrimeIntellect-ai/verifiers), [`renderers`](https://github.com/PrimeIntellect-ai/renderers), [`prime-envs`](https://github.com/PrimeIntellect-ai/prime-envs), and `pydantic-config` submodules, installs `uv`, and runs `uv sync --all-extras`. For manual installation or troubleshooting, see the [README](https://github.com/PrimeIntellect-ai/prime-rl#setup).
 
-You need at least one NVIDIA GPU (RTX 3090/4090/5090, A100, H100, H200, or B200). Single-GPU runs are supported for debugging; production RL is typically 1× inference node + 1+ trainer nodes.
+## Your First RL Run
 
-## Quick Run
-
-Train an SFT-warmed `Qwen3-0.6B` on the `reverse-text` task — the env is bundled with the [`verifiers`](https://github.com/PrimeIntellect-ai/verifiers) submodule so no separate install is needed. This config ships in the repo and runs on two GPUs (one for inference, one for the trainer):
+Try the bundled `reverse-text` example—it trains an SFT-warmed `Qwen3-0.6B` on 2 GPUs (GPU 0 for inference, GPU 1 for training) with no extra environment installs needed:
 
 ```bash
 uv run rl @ examples/basic/reverse-text/rl.toml
 ```
 
-The `rl` entrypoint reads `examples/basic/reverse-text/rl.toml`, splits it into per-process sub-configs, picks GPU 0 for inference and GPU 1 for the trainer, launches all three processes, and tees their stdout into the run directory at `outputs/<run_name>/logs/latest/{trainer,orchestrator,inference}.log` (`run.name` auto-generates as `<envs>--<model>--<short-id>`; pass `--run.name <name>` for a predictable path). Within a minute the trainer should log `step 1` and a reward sample; after 20 steps the run completes with a final DCP checkpoint at `outputs/<run_name>/checkpoints/step_20`.
+What happens when you run this:
 
-## Documentation
+1. The `rl` launcher reads `rl.toml`, splits it into configs for the trainer, orchestrator, and inference server, and starts all three.
+2. Logs stream to `outputs/<run_name>/logs/latest/{trainer,orchestrator,inference}.log`. Run names default to `<envs>--<model>--<short-id>`—pass `--run.name <name>` if you want a predictable folder name.
+3. Within about a minute, you should see `step 1` and reward samples in the logs. After 20 steps, the run finishes and saves a checkpoint to `outputs/<run_name>/checkpoints/step_20`.
 
-- **[Configuration](configuration.md)** — TOML composition, CLI overrides, dry-run.
-- **[Training](training.md)** — Launch and observe RL and SFT runs.
-- **[Inference](inference.md)** — vLLM-backed server (or fleet) holding the current policy.
-- **[Scaling](scaling.md)** — Single-GPU through multi-node clusters via FSDP / EP / CP and SLURM.
-- **[Algorithms](algorithms.md)** — Async semantics, loss / advantage / filter plugins, trajectory merging.
-- **[Advanced](advanced.md)** — Custom modeling, multimodal, LoRA, P/D inference.
-- **[Development](development.md)** — Test suite, pre-commit hooks, adding a new model.
+## Where to Go Next
+
+- **[Configuration](configuration.md)** — How TOML files, overlays, CLI flags, env vars, and environment sources work.
+- **[Training](training.md)** — Running RL, SFT, and pretraining; checkpoints, resuming, live control, logs, and dashboards.
+- **[Eval](eval.md)** — Running standalone evaluations against Prime Inference or your own vLLM server.
+- **[Inference](inference.md)** — Single-node, multi-node, P/D disaggregation, routers, KV offload, and adaptive concurrency.
+- **[Scaling](scaling.md)** — Going from 1 GPU to 1,000+ GPUs with FSDP, EP, CP, SLURM, and throughput benchmarking.
+- **[ModelExpress](model-express.md)** — RDMA weight broadcasts without a trainer-to-inference NCCL collective.
+- **[Algorithms](algorithms.md)** — Async staleness, GRPO/MaxRL/RAE/OPD/OPSD/ECHO, curricula, and multi-turn trajectory merging.
+- **[IPO](ipo.md)** — Why `prime-rl` masks tokens by probability difference instead of ratio.
+- **[Advanced](advanced.md)** — Supported model families, FP8/MXFP8/SonicMoE precision, multimodal VLMs, LoRA, and P/D setup.
+- **[Development](development.md)** — Running tests, CI workflows, and bringing up a new model or VLM.

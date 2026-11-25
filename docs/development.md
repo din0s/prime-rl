@@ -1,91 +1,72 @@
 # Development
 
-This page covers workflows for developing on `prime-rl` itself — running the test suite, contributing changes, and adding new model architectures with the small-scale tooling we use to iterate on MoE families without booting up a 100B+ run.
+Guide for contributing to `prime-rl`: running tests locally, understanding GPU CI, and bringing up new text or multimodal model architectures without booting a 100B+ cluster.
 
-## Table of Contents
+## Pre-Commit Setup
 
-- [Test Suite](#test-suite)
-  - [Layout](#layout)
-  - [Running Tests Locally](#running-tests-locally)
-  - [CI Workflows](#ci-workflows)
-  - [Markers](#markers)
-- [Pre-Commit Hooks](#pre-commit-hooks)
-- [Adding a New Model](#adding-a-new-model)
-  - [Implement the Modeling Code](#implement-the-modeling-code)
-  - [Register a Mini Preset](#register-a-mini-preset)
-  - [Run the Smoke Test](#run-the-smoke-test)
-- [Adding a Custom VLM Implementation](#adding-a-custom-vlm-implementation)
-
-## Test Suite
-
-The test suite is split into three tiers.
-
-### Layout
-
-- **`tests/unit/`** — fast-running, hermetic tests for isolated logic: config parsing and validation, advantage / loss / scheduler / packer math, individual dataset paths, model-conversion roundtrips, etc. Tests that need a GPU are tagged with the `gpu` marker.
-- **`tests/integration/`** — full-stack RL/SFT runs on a tiny model end-to-end through inference + orchestrator + trainer.
-- **`tests/regression/`** — nightly regression suites: `test_parallel_invariance.py`, which checks that DP/CP/EP layouts train the same first step as a single GPU, and evals from `configs/eval/` compared against `baselines/eval/`.
-
-### Running Tests Locally
-
-```bash
-uv run pytest -v                                           # everything
-uv run pytest tests/unit -v                                # unit only
-uv run pytest tests/integration -v                         # integration only
-uv run pytest -v -m "not gpu"                              # CPU-only subset (mirrors CPU CI)
-uv run pytest -v -m gpu                                    # GPU-only subset
-uv run pytest tests/unit tests/integration -m tiny -v      # fast GPU subset (mirrors the Tiny (GPU) job)
-uvx modal run scripts/modal_ci.py --suite tiny             # the Tiny (GPU) job itself, on Modal
-uvx modal run scripts/modal_ci.py --suite full --group rest  # one group of the full GPU suite, on Modal
-uv run pytest tests/integration/test_reverse_text.py -vvs  # one specific scenario
-uv run playwright install --only-shell chromium            # browser for the integration dashboard smoke tests
-```
-
-### CI Workflows
-
-| Workflow | Trigger | What runs | Where |
-|---|---|---|---|
-| [`tests.yml`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/.github/workflows/tests.yml) | CPU jobs: every PR + push to `main`. `gsm8k_eval`: relevant changes in non-draft PRs, every push to `main`, manual dispatch | CPU: `pytest tests/unit -m "not gpu"`, plus a slim-wheel install check that `prime-rl-configs` imports cleanly without heavy deps (no torch / vllm / transformers / wandb / verifiers / datasets / liger / loguru in `sys.modules`). Separate hosted `gsm8k_eval` job | `ubuntu-latest` |
-| [`gpu-tiny.yml`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/.github/workflows/gpu-tiny.yml) | Every push to a non-draft PR from this repo (opened, synchronized, reopened, marked ready for review). Also manual dispatch | `Tiny (GPU)`: the fast GPU subset, `pytest tests/unit tests/integration -m tiny` (distributed invariance, offloading and checkpointing, GPU loss tests, short RL and SFT runs), split by `scripts/modal_ci.py` into test groups that run in parallel | Modal, one container per test group (2xH100 or 1xH100), started from `ubuntu-latest` |
-| [`gpu.yml`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/.github/workflows/gpu.yml) | On a PR: applying the `gpu-ci` label (Triage or higher). Also every merge to `main` and manual dispatch | `Tiny (GPU)` first, then the full GPU suite: every GPU test, `pytest tests/unit tests/integration -m gpu`, as one job per test group of `scripts/modal_ci.py` ([`gpu-full.yml`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/.github/workflows/gpu-full.yml)): one per integration test, the slowest unit test files on their own, and the rest | Modal, one container per test group (2xH100 or 1xH100), started from `ubuntu-latest` |
-| [`regression.yml`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/.github/workflows/regression.yml) | 03:00 PST daily + manual `workflow_dispatch` (`suite` picks one suite; `eval_config` picks one eval config); `eval` also on PRs that touch it | `parallel`: `tests/regression/test_parallel_invariance.py`. `eval`: every `tests/regression/configs/eval/*.toml` (gsm8k, PI-TerminalBench2.1) against Prime Inference, each compared against its baseline in `tests/regression/baselines/eval/`. Nightly and manual runs post one Slack message per config through the `SLACK_WEBHOOK_URL` secret | `eval`: `ubuntu-latest`. `parallel`: Modal (4xH100), started from `ubuntu-latest` |
-
-Every push to a non-draft PR runs the `Tiny (GPU)` job, and a newer push cancels the PR's queued or in-flight Tiny run. Draft PRs run no GPU jobs. To run the full GPU suite on a PR's current commit, apply the `gpu-ci` label (drafts included). The workflow removes the label when it starts, so re-apply it to run again after new pushes or to retry. A new label trigger cancels the PR's queued or in-flight full-suite run. The full suite starts only when its Tiny job passes, and runs one at a time across PRs and `main`, two test groups at once, so that Tiny runs keep enough GPUs: a run waits for the one in progress, and a newer waiting run replaces an older one (re-apply the label). Fork PRs cannot run GPU CI: a maintainer can push the branch to this repo and label that PR. A PR with merge conflicts cannot run it until the conflicts are resolved.
-
-### Markers
-
-Three pytest markers are declared in `pyproject.toml` (`addopts = "--strict-markers"`):
-
-- `gpu` — gate a test that needs CUDA. CPU CI uses `-m "not gpu"`; the `Full (GPU)` job runs every `gpu` test. A GPU test in a file that no group in `scripts/modal_ci.py` lists runs in the full suite's 2-GPU `rest` group, so a test file that takes minutes of its own gets a new group there, and a job in `gpu-full.yml`'s matrix.
-- `slow` — gate a test that's expensive enough you'd usually skip it locally. Deselect with `-m "not slow"`.
-- `tiny` — add a GPU test to the fast subset that the `Tiny (GPU)` job runs on Modal for every push to a non-draft PR: distributed invariance, offloading and checkpointing, the GPU loss tests, and short RL and SFT runs. `scripts/modal_ci.py` runs each test group in its own container, so the job takes as long as its slowest group, the RL run (~2.5 min). A tiny test in a file that no group lists runs in the 1-GPU group, so a test that needs 2 GPUs or minutes of its own gets a new group there. Check the test's time with `--durations=0` before marking it.
-
-## Pre-Commit Hooks
-
-Install the [pre-commit](https://pre-commit.com) hooks before your first commit so ruff check + format run on staged Python files automatically:
+Install pre-commit hooks before your first commit so `ruff` lints and formats staged Python files automatically:
 
 ```bash
 uv run pre-commit install
 ```
 
+## Testing
+
+The test suite has three layers:
+- **`tests/unit/`** — Fast, isolated tests (config validation, loss/advantage/packer math, weight conversion roundtrips). GPU-requiring tests carry `@pytest.mark.gpu`.
+- **`tests/integration/`** — End-to-end RL and SFT runs on tiny models through inference + orchestrator + trainer.
+- **`tests/regression/`** — Nightly invariance tests (`test_parallel_invariance.py` checks DP/CP/EP matches 1-GPU step 1) and evals vs. baselines.
+
+### Running Tests Locally
+
+```bash
+uv run pytest -v -m "not gpu"                              # CPU-only (fast; mirrors CPU CI)
+uv run pytest tests/unit tests/integration -m tiny -v      # Fast GPU subset (mirrors Tiny GPU CI)
+uv run pytest -v -m gpu                                    # Full GPU suite
+uv run pytest tests/integration/test_reverse_text.py -vvs  # Single integration test
+
+# Run the exact Modal GPU CI suites directly from your shell
+uvx modal run scripts/modal_ci.py --suite tiny
+uvx modal run scripts/modal_ci.py --suite full --group rest
+
+# Required once if running dashboard integration smoke tests
+uv run playwright install --only-shell chromium
+```
+
+### Pytest Markers
+
+Defined in `pyproject.toml` (`--strict-markers`):
+- `gpu` — Needs CUDA. Unlisted files run in the full suite's 2-GPU `rest` group in `scripts/modal_ci.py` (give multi-minute files their own group + `gpu-full.yml` matrix entry).
+- `tiny` — Fast GPU subset run on every push to a non-draft PR (~2.5 min total on Modal). Unlisted files default to the 1-GPU group—add a dedicated group if a test needs 2 GPUs or >1 min (check with `--durations=0`).
+- `slow` — Expensive tests you can skip locally via `-m "not slow"`.
+
+### CI Workflows
+
+- **[`tests.yml`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/.github/workflows/tests.yml):** Runs CPU unit tests on every PR/push, verifies `prime-rl-configs` imports cleanly with zero heavy ML deps, and runs a hosted `gsm8k_eval` job when relevant files change.
+- **[`gpu-tiny.yml`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/.github/workflows/gpu-tiny.yml):** Runs `Tiny (GPU)` on Modal for every push to a non-draft PR (newer pushes cancel older runs; draft PRs skip GPU jobs).
+- **[`gpu.yml`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/.github/workflows/gpu.yml):** Runs `Tiny (GPU)` followed by the full GPU suite (`gpu-full.yml`) on every merge to `main`, or on any PR when you apply the **`gpu-ci`** label (the workflow removes the label once started; re-apply to re-run). Full runs execute one at a time globally to keep GPUs free for Tiny jobs. Fork PRs cannot run GPU CI directly.
+- **[`regression.yml`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/.github/workflows/regression.yml):** Daily at 03:00 PST (and manual dispatch) for parallel invariance (4×H100 Modal) and baseline eval checks (posts to Slack).
+
+---
+
 ## Adding a New Model
 
-Bringing up a new model family is three steps: implement the modeling code, register a mini preset, and run the smoke test. The preset and smoke test let you iterate on the modeling code at ~0.5B scale on 1–2 GPUs instead of paying the cost of the full-size model — useful for catching bugs in modeling code, state-dict conversions, and pipeline integration before scaling.
+Bringing up a new architecture takes three steps—iterating on a ~0.5B random-weight "mini" clone on 1–2 GPUs first so you catch conversion and pipeline bugs in minutes instead of hours.
 
-### Implement the Modeling Code
+### 1. Implement the Model
 
-Drop the modeling code under `src/prime_rl/trainer/models/<arch>/`, mirroring an existing family (`glm4_moe/` or `qwen3_moe/` are good starting points). A model family provides:
+Create `src/prime_rl/trainer/models/<arch>/`, using `glm4_moe/` or `qwen3_moe/` as a template:
 
-- **Config**: a subclass of HF `PretrainedConfig`, so the `config.json` the trainer writes stays loadable by vLLM.
-- **Model**: an inner model and a `*ForCausalLM`, both subclassing `PreTrainedModelPrimeRL` (`models/base.py`, a plain `nn.Module`) and ending `__init__` with `self.post_init()`, which initializes the weights off the meta device and then ties them. The inner model returns the output dataclasses from `models/base.py`.
-- **Tying**: set `supports_tied_word_embeddings = True` on the `*ForCausalLM` if the architecture allows tying `lm_head` to the input embeddings. The config's `tie_word_embeddings` then decides whether a checkpoint ties.
-- **Init**: override `_init_weights` for parameters the default init does not cover, calling `super()._init_weights(module)` first, and `init_buffers_post_meta` for buffers no checkpoint carries.
-- **Conversion**: `conversion_chain`, `is_hf_state_dict` and `is_prime_state_dict`, which map between the HF checkpoint and the training layout.
-- **Registration**: the config class / model class pair in `_CUSTOM_CAUSAL_LM_MODELS` (`models/__init__.py`), and the config class with `AutoConfig.register`. A VLM family also registers its composite `model_type` in `_CUSTOM_VLM_MAPPING`.
+- **Config:** Subclass HF `PretrainedConfig` so saved `config.json` files stay loadable by vLLM.
+- **Model classes:** An inner model and a `*ForCausalLM`, both subclassing `PreTrainedModelPrimeRL` (`models/base.py`), returning `models/base.py` output dataclasses, and ending `__init__` with `self.post_init()`.
+- **Weight tying:** Set `supports_tied_word_embeddings = True` on `*ForCausalLM` if the architecture supports tying `lm_head` to input embeddings (`config.tie_word_embeddings` controls whether a checkpoint ties).
+- **Initialization:** Override `_init_weights` (calling `super()._init_weights(module)` first) for custom parameters, and `init_buffers_post_meta` for buffers not stored in checkpoints.
+- **State-dict conversion:** Implement `conversion_chain`, `is_hf_state_dict`, and `is_prime_state_dict` to map cleanly between HF checkpoints and trainer layout.
+- **Registration:** Register the `(config, model)` pair in `_CUSTOM_CAUSAL_LM_MODELS` (`models/__init__.py`) and call `AutoConfig.register`.
 
-### Register a Mini Preset
+### 2. Add a Mini Preset
 
-Add an entry to [`scripts/mini_moe.py`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/scripts/mini_moe.py) so the smoke-test workflow can build a ~0.5B test model in your architecture. The preset names the config class, picks small dimensions, and wires up the HF + prime-rl model classes plus a tokenizer source:
+Add a small ~0.5B preset in [`scripts/mini_moe.py`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/scripts/mini_moe.py):
 
 ```python
 ARCH_PRESETS = {
@@ -96,68 +77,44 @@ ARCH_PRESETS = {
         "prime_model_class": PrimeRLGlm4MoeForCausalLM,
         "tokenizer_source": "THUDM/GLM-4-9B-0414",
     },
-    # add your arch here
 }
 ```
 
-### Run the Smoke Test
-
-Build the mini model. This creates a ~543M-parameter GLM-4 MoE (1024 hidden, 24 layers, 8 experts) with random weights, copies the tokenizer from the original GLM-4 model, and verifies the HF↔prime-rl roundtrip is lossless:
+### 3. Build, SFT-Warmup & Smoke Test
 
 ```bash
+# 1. Generate mini model + verify lossless HF <-> prime-rl conversion roundtrip
 uv run python scripts/mini_moe.py --arch glm4_moe --output-dir ./mini-glm-moe
-```
+# (Re-check conversion later without regenerating: add --verify-only)
 
-To re-verify the roundtrip after a modeling-code change without re-creating the model:
+# 2. Quick SFT warmup so the distribution is non-uniform (loss ~12 -> ~2.5)
+#    Or skip and use the prebuilt checkpoint: samsja/mini-glm-moe
+uv run sft --model.name ./mini-glm-moe --max_steps 200 --optim.lr 1e-4 --ckpt
 
-```bash
-uv run python scripts/mini_moe.py --arch glm4_moe --output-dir ./mini-glm-moe --verify-only
-```
-
-Warm up the random-weight mini model with SFT on reverse-text so KL divergence becomes meaningful in the RL phase. Loss drops from ~12 to ~2.5 — the output won't be coherent, but the distribution is non-trivial. A pre-built SFT'd checkpoint lives at [samsja/mini-glm-moe](https://huggingface.co/samsja/mini-glm-moe) if you want to skip this step:
-
-```bash
-uv run sft \
-  --model.name ./mini-glm-moe \
-  --max_steps 200 \
-  --optim.lr 1e-4 \
-  --ckpt
-```
-
-Then run the full RL stack on reverse-text:
-
-```bash
+# 3. Run full RL stack end-to-end
 uv run rl @ configs/ci/integration/reverse-text-moe/start.toml \
   --model.name samsja/mini-glm-moe \
   --inference.vllm.gpu-memory-utilization 0.7 \
   --inference.vllm.max-model-len 2048
 ```
 
-What to look for:
+Verify three things: no crashes, finite non-zero KL, and healthy (non-NaN) loss. (Don't expect reward to climb in 20 steps on a random mini model.)
 
-- **No crashes.** Validates the full inference + orchestrator + trainer pipeline end-to-end.
-- **Finite, non-zero KL.** Confirms the reference distribution is meaningful.
-- **Loss reasonable.** Not NaN, not stuck.
+### Merge Requirements for New Models
 
-Don't expect reward to climb meaningfully in 20 steps on a random model.
+1. Satisfies the modeling contract above and passes the mini smoke test.
+2. PR description includes a **20-step KL mismatch table** on the `math` environment (`batch_size = 64`) where **every entry is `< 0.015`** (proving numerical alignment with vLLM).
 
-### Requirements for merging a new model
+---
 
-Before merging a new model, you need to ensure the following:
+## Adding a Custom VLM
 
-- The model meets the contract in [Implement the Modeling Code](#implement-the-modeling-code).
-- The small smoke test passes.
+VLM training (`[model.vlm]`) only supports registered PrimeRL VLM classes. Use `models/qwen3_5/` as the reference implementation and follow this order:
 
-In the PR that adds the new model, you also need to provide a table covering the KL mismatch across 20 steps on `math` environment with `batch_size=64`. All the entries in the table must lower than 0.015. If this is not met, the PR will not be merged (unless reasonable justification is provided). This is to ensure all our models are consistent and their implementations match the implementations in the inference framework.
-
-## Adding a Custom VLM Implementation
-
-VLM training (any run with `[model.vlm]` set, SFT or RL) is custom-implementation-only: `get_model` rejects models without a custom PrimeRL VLM class at load time. To make a new VLM family trainable, extend a custom text model with a composite VLM body. The unified dense/MoE Qwen3.5 implementation in `models/qwen3_5/` is the reference. The pieces, in dependency order:
-
-1. **Custom text model first.** The VLM body wraps a custom `*ForCausalLM` (see [Adding a New Model](#adding-a-new-model)), so the text side — including its state-dict conversion and KL-mismatch table — comes first.
-2. **Composite VLM body.** A `*VLMModel` that holds the vision encoder and custom text model, embeds tokens, runs vision, scatters image embeddings over placeholder tokens, and builds MRoPE 3D positions from `mm_token_type_ids` whenever `image_grid_thw` is given (the renderer owns the token→modality mapping; the trainer always passes plain `position_ids`, which the model uses for text-only rows). Keep the vision encoder at `model.model.visual` and the text model at `model.model.language_model`: FSDP, freezing, activation checkpointing, compile, the MoE runtime and NCCL weight broadcast find them there (`trainer/vlm.py`). The unified `*ForCausalLM` dispatches on the config: composite config → VLM path, text config → text path.
-3. **Always run the vision encoder.** Text-only micro-batches must feed the encoder dummy pixels and graft the result into the graph with zero contribution (`inputs_embeds + image_embeds.sum() * 0.0`) so FSDP/EP collectives stay symmetric across ranks when the encoder is trainable.
-4. **Packed-boundary consumption.** Samples pack into shared rows with per-document boundaries in `seq_lens`; every custom model's `forward()` declares the typed `seq_lens`/`seq_lens_are_pre_shard` parameters (the trainer passes them unconditionally) and must honor the boundaries — varlen flash `cu_seqlens`, linear-attention state resets per document, and a loud rejection on attention paths that can't (see the packed-batch guard in any modeling file). Set `supports_packed_multimodal_training` on the VLM model once packed rows are handled — RL fails loudly at startup for VLM models without it.
-5. **Registration.** Register the composite `model_type` in `_CUSTOM_VLM_MAPPING` (`models/__init__.py`) so `get_model` dispatches to the custom class. RL turns raw image refs into vision kwargs with the model class's `materialize_images(refs, processor)`; Qwen3.5 and Qwen3.8 Flash Next each define it in their `vision.py`, and a new family implements its own.
-6. **Context parallelism (optional).** CP-capable VLMs hold a `CPContext` on all modules which need to be CP-aware and shard embeds/positions inside the model after the vision merge; the trainers defer sharding to the model for every batch with images.
-7. **Validation.** Same bar as text models: the KL-mismatch table for the text path, plus an SFT run and an RL run on a real multimodal dataset (the `color-codeword` environment is the reference task).
+1. **Text model first:** Complete the text `*ForCausalLM`, state-dict conversions, and `< 0.015` KL-mismatch table.
+2. **Composite VLM body (`*VLMModel`):** Hold the vision encoder at `model.model.visual` and the language model at `model.model.language_model` (FSDP, freezing, AC, compile, MoE runtime, and weight broadcast expect those exact attribute paths). Embed tokens, run vision, scatter image embeddings into placeholder slots, and compute MRoPE 3D positions from `mm_token_type_ids` when `image_grid_thw` is present (falling back to plain `position_ids` for text-only rows). Dispatch VLM vs. text path inside the unified `*ForCausalLM` based on config type.
+3. **Keep FSDP/EP symmetric on text-only micro-batches:** Always run the vision encoder on dummy pixels and add `image_embeds.sum() * 0.0` to `inputs_embeds` so ranks never hang when the encoder is unfrozen.
+4. **Honor packed boundaries:** Accept `seq_lens` and `seq_lens_are_pre_shard` in `forward()`, respect per-document boundaries in varlen FlashAttention (`cu_seqlens`) and linear-attention state resets, and set `supports_packed_multimodal_training = True` once verified.
+5. **Register:** Add the composite `model_type` to `_CUSTOM_VLM_MAPPING` (`models/__init__.py`) and implement `materialize_images(refs, processor)` (see `vision.py` in Qwen3.5 / Qwen3.8).
+6. **Optional CP:** Attach `CPContext` to CP-aware modules and shard embeddings/positions *after* vision scatter (trainers defer sharding to the model for image batches).
+7. **Validate:** Text KL-mismatch table + a real multimodal SFT run and RL run (using the `color-codeword` environment).
